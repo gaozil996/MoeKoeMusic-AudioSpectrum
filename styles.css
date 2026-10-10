@@ -1,0 +1,45 @@
+/* ============================================================
+   频谱 · 样式
+
+   挂载点在 .lyrics-screen 内、歌词那一栏之前（见 content.js 的
+   ensureStage）。于是层级关系是：
+
+       .lyrics-screen       position:fixed，整窗大小，
+                            background 是那层 60% 深灰遮罩
+         ├ .bg-layer …       z=-1，专辑图
+         ├ .viz-stage        ← 频谱，本文件定义
+         ├ .lyrics column    ← 歌词，同 z-index 时靠 DOM 顺序在上
+         ├ button.close-btn  z=99
+         └ .lyrics-settings  z=101
+
+   遮罩是 lyrics-screen 自己的 background，画在所有子元素之下，
+   所以频谱既不会被压暗，又在歌词之下。
+
+   用 absolute 而不是 fixed：底边永远贴着歌词页的底边，
+   不会因为播放器、控制条、任务栏的高度变化而悬空。
+   ============================================================ */
+
+.viz-stage {
+  position: absolute;
+  left: 0;
+  right: 0;
+  /* 0 = 紧贴底边。之前留的 66px 是凭感觉加的，实测 .lyrics-bg 就是
+     fixed inset:0，窗底即歌词页底，留白只会让频谱浮在半空里。 */
+  bottom: 0;
+  width: 100%;
+  height: var(--viz-h, 150px);
+  z-index: 0;
+  pointer-events: none;
+  display: none;
+  opacity: var(--viz-op, .72);
+}
+
+.viz-stage.on {
+  display: block;
+}
+
+.viz-stage canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
