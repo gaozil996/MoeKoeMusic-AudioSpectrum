@@ -41,11 +41,23 @@ using NAudio.Wave;
 
 static class Program
 {
-    const int FFT_SIZE = 8192;
+    // Latency budget, biggest term first. The display shows a window of audio
+    // whose centre is already in the past, so the window length IS the lag:
+    //   4096 @ 48 kHz  ->  85 ms window, ~43 ms of that is centre age
+    //   8192 @ 48 kHz  -> 170 ms window, ~85 ms of that is centre age
+    // Halving it was the single largest cut available. The price is 11.7 Hz
+    // per bin instead of 5.9; MIN_BINS still guarantees 3 bins per band, which
+    // is what keeps the left half populated. 2048 was tried and failed --
+    // 1-2 bins per band read as noise and left that half of the display empty.
+    const int FFT_SIZE = 4096;
     const int BANDS = 64;
     const int MIN_BINS = 3;       // every band must span at least this many bins
     const int MAX_MSG = 60 * 1024;
-    const int FRAME_MS = 40;          // ~25 fps, plenty smooth
+    const int FRAME_MS = 10;          // Windows sleeps in ~15.6 ms ticks, so
+                                      // anything from ~1 to 15 rounds up to one
+                                      // tick and lands at ~64 fps. 16 was the
+                                      // trap: it rounded to two ticks and gave
+                                      // 33 fps.
     const double DB_RANGE = 40.0;     // visible dynamic range, in dB
     const double DB_HEADROOM = 8.0;   // keep the loudest band off the ceiling
     const double AGC_ATTACK = 1.0;    // track a rise instantly
@@ -597,8 +609,11 @@ static class Program
         // thin carries almost no energy, which is why the left half of the
         // display stayed empty no matter how the gain was set.
         //
-        // 8192 points at 48 kHz gives 5.9 Hz per bin, and MIN_BINS guarantees
-        // no band is ever thinner than 3 bins.
+        // 4096 points at 48 kHz gives 11.7 Hz per bin, and MIN_BINS guarantees
+        // no band is ever thinner than 3 bins -- 35 Hz across the narrow end,
+        // which is wide enough to carry a stable magnitude. Going finer than
+        // this only buys resolution the display does not use, at 85 ms of lag
+        // per doubling.
         double lo = Math.Log10(35.0), hi = Math.Log10(16000.0);
         double binHz = (double)sr / FFT_SIZE;
 
