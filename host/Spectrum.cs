@@ -41,23 +41,57 @@ using NAudio.Wave;
 
 static class Program
 {
-    // Latency budget, biggest term first. The display shows a window of audio
-    // whose centre is already in the past, so the window length IS the lag:
-    //   4096 @ 48 kHz  ->  85 ms window, ~43 ms of that is centre age
-    //   8192 @ 48 kHz  -> 170 ms window, ~85 ms of that is centre age
-    // Halving it was the single largest cut available. The price is 11.7 Hz
-    // per bin instead of 5.9; MIN_BINS still guarantees 3 bins per band, which
-    // is what keeps the left half populated. 2048 was tried and failed --
-    // 1-2 bins per band read as noise and left that half of the display empty.
-    const int FFT_SIZE = 4096;
+    // Latency budget, biggest term first, after measuring rather than guessing.
+    //
+    // The `age=` field in the frame log is the measured age of the newest
+    // audio sample in the ring when the frame was computed. With the loopback
+    // tap running and music playing it reads 0-30 ms, so capture is NOT the
+    // problem -- that was worth checking, because a 100 ms NAudio endpoint
+    // buffer is the usual suspect and the bundled 1.10 turns out not to do
+    // that. It initialises to the device period, roughly one 10 ms period.
+    //
+    // What is left is the analysis window plus three smoothing tails:
+    //   2048 @ 48 kHz  ->  42.7 ms window, ~21 ms of centre age
+    //   4096 @ 48 kHz  ->  85.3 ms window, ~43 ms of centre age
+    // The window length IS the lag: a spectrum cannot describe audio that has
+    // not been recorded yet. 2048 is close to the physical floor -- 100 Hz
+    // has a 10 ms period, so even one cycle of the lowest useful band needs
+    // half of a 2048 window.
+    //
+    // 2048 used to be rejected here because the narrow log-spaced bands then
+    // spanned 1-2 bins, whose magnitudes jump frame to frame and read as
+    // noise, leaving the low half of the display empty. Widening the bands
+    // (raising MIN_BINS) cannot fix that -- a band made wider still only
+    // holds the same 1-2 bins' worth of energy. The fix is averaging over
+    // time, which is what AVG_LOW does below. Resolution is bought with a few
+    // frames of history instead of a longer window, because frames of history
+    // cost latency only in proportion and can be made band-dependent.
+    const int FFT_SIZE = 2048;
     const int BANDS = 64;
-    const int MIN_BINS = 3;       // every band must span at least this many bins
+    const int MIN_BINS = 2;       // every band must span at least this many bins
+
+    // Temporal smoothing per band, applied to the raw dB before anything else.
+    // Only the first handful of bands are thin enough to need it; the ramp is
+    // therefore steep (pow 0.35), so the low end gets stability and the rest
+    // of the display is left as responsive as it was before.
+    const double AVG_HIGH = 0.60; // strongest band: barely averaged
+    const double AVG_LOW = 0.28;  // weakest band: tau ~ 2.6 frames
+
+    // Release smoothing on the mapped 0..1 bar value. This is what the eye
+    // reads as "the bars lag the music", so it is kept short. 0.55/0.45 is a
+    // one-frame time constant; the visual smoothing lives in the renderer,
+    // which has the real frame delta and can be tuned per display rate.
+    const double SMOOTH_UP = 0.66;
+    const double SMOOTH_DOWN = 0.45;
     const int MAX_MSG = 60 * 1024;
-    const int FRAME_MS = 10;          // Windows sleeps in ~15.6 ms ticks, so
-                                      // anything from ~1 to 15 rounds up to one
-                                      // tick and lands at ~64 fps. 16 was the
-                                      // trap: it rounded to two ticks and gave
-                                      // 33 fps.
+    const int FRAME_MS = 10;          // Windows rounds Thread.Sleep up to the
+                                      // scheduler tick (~15.6 ms), so this
+                                      // really runs at ~15.6 ms and cannot be
+                                      // asked for less without spinning. Left
+                                      // alone deliberately: burning a core to
+                                      // recover 5 ms is a bad trade. 16 was the
+                                      // trap -- it rounds to two ticks and
+                                      // gives 33 fps.
     const double DB_RANGE = 40.0;     // visible dynamic range, in dB
     const double DB_HEADROOM = 8.0;   // keep the loudest band off the ceiling
     const double AGC_ATTACK = 1.0;    // track a rise instantly
@@ -222,6 +256,16 @@ static class Program
         t.Dev = dev;
         t.Name = dev.FriendlyName;
         var cap = new WasapiLoopbackCapture(dev);
+        // NOTE on buffer size: the bundled NAudio is 1.10, where
+        // WasapiLoopbackCapture only offers (MMDevice) -- there is no
+        // BufferMilliseconds property and no ctor overload that takes one, so
+        // the endpoint buffer cannot be shrunk from here. What it actually
+        // initialises to is the device's AudioClientPeriodSize, roughly one
+        // period (~10 ms at 48 kHz).
+        //
+        // The age field in the frame log is there so this file stops guessing
+        // about where the lag lives. Measure, then fix the term that is
+        // actually large.
         var fmt = cap.WaveFormat;
         t.SampleRate = fmt.SampleRate;
         t.Ch = Math.Max(1, fmt.Channels);
@@ -315,6 +359,11 @@ static class Program
     static float[] smooth = new float[BANDS];
     static float[] peak = new float[BANDS];
     static double[] bandDb = new double[BANDS];
+    // Time-averaged band level. Averaging here rather than widening the bands
+    // is what makes the short window usable: a 1-bin band averaged over a few
+    // frames reads as steady, the same bin not averaged does not.
+    static double[] bandAvg = new double[BANDS];
+    static bool bandAvgPrimed = false;
     static double agcCeil = -24.0;     // running loudest band, in dB
     static double agcFloor = -78.0;
     // 0, not 48000. The band edges are derived from the sample rate, so
@@ -392,7 +441,13 @@ static class Program
 
             if (++tick % 100 == 0)
                 HostLog("frames=" + frame + " rms=" + frameRms.ToString("F4")
-                    + " taps=" + n + " src=" + (lastWinner.Length > 0 ? lastWinner : "-"));
+                    + " taps=" + n + " src=" + (lastWinner.Length > 0 ? lastWinner : "-")
+                    // Only meaningful while audio is actually flowing. During
+                    // silence no samples arrive, so LastByteAt goes stale and
+                    // the age reads tens of seconds -- a measurement artefact,
+                    // not latency.
+                    + " age=" + (frameRms >= SILENT_RMS ? frameAgeMs.ToString() : "off")
+                    + "ms peak=" + frameAgeMax + "ms");
             Thread.Sleep(FRAME_MS);
         }
     }
@@ -484,6 +539,14 @@ static class Program
             frameRms = n == FFT_SIZE ? Math.Sqrt(energy / FFT_SIZE) : 0;
             frame++;
 
+            if (t != null && t.LastByteAt > 0)
+            {
+                int age = (int)(Environment.TickCount - t.LastByteAt);
+                if (age < 0) age = 0;
+                frameAgeMs = age;
+                if (age > frameAgeMax) frameAgeMax = age;
+            }
+
             if (window == null) BuildWindow();
 
             double frameMaxDb = -200.0;
@@ -521,6 +584,18 @@ static class Program
                     bandDb[b] = db;
                     if (db > frameMaxDb) frameMaxDb = db;
                 }
+
+                // Time-average, strongest response on the bands that span most
+                // bins. First frame primes the average outright so a song
+                // change does not fade in from a stale history.
+                for (int b = 0; b < BANDS; b++)
+                {
+                    double a = AVG_LOW + (AVG_HIGH - AVG_LOW) * Math.Pow(b / (double)(BANDS - 1), 0.35);
+                    if (!bandAvgPrimed) bandAvg[b] = bandDb[b];
+                    else bandAvg[b] += (bandDb[b] - bandAvg[b]) * a;
+                    bandDb[b] = bandAvg[b];
+                }
+                bandAvgPrimed = true;
             }
             else
             {
@@ -569,11 +644,14 @@ static class Program
                 // whole display into a solid wall.
                 v = Math.Pow(v, 0.68);
 
-                // Attack fast, release slow. This is what makes a spectrum read
-                // as "music" rather than as a bar chart of noise.
+                // Attack fast, release fast. This filter used to be 0.22/0.78 on the way
+                // down, a 3.5-frame tail that showed up as the bar visibly
+                // trailing every drum hit. The renderer does the smoothing
+                // that actually reads well, and it knows the real frame time;
+                // keeping a second long tail here just stacked delay on delay.
                 float t2 = (float)v;
-                if (t2 > smooth[b]) smooth[b] = t2 * 0.66f + smooth[b] * 0.34f;
-                else smooth[b] = t2 * 0.22f + smooth[b] * 0.78f;
+                if (t2 > smooth[b]) smooth[b] = t2 * (float)SMOOTH_UP + smooth[b] * (1.0f - (float)SMOOTH_UP);
+                else smooth[b] = t2 * (float)SMOOTH_DOWN + smooth[b] * (1.0f - (float)SMOOTH_DOWN);
 
                 int target = (int)Math.Round(smooth[b] * 255.0);
                 if (target > peak[b]) peak[b] = target;
@@ -582,7 +660,7 @@ static class Program
                 // slowly and ends up hovering well above the bar tip as a
                 // detached floating dash. Matching the shape keeps the cap
                 // sitting just above the bar, where it belongs.
-                else peak[b] *= 0.972f;
+                else peak[b] *= 0.93f;
 
                 if (b > 0) sb.Append(',');
                 sb.Append(target);
@@ -670,4 +748,11 @@ static class Program
 
     static int frame = 0;
     static double frameRms = 0;
+    // Age, in ms, of the newest audio sample in the winning tap's ring at the
+    // moment the frame was computed. This is the real capture-to-emit latency
+    // and it is measured, not derived: whatever the WASAPI buffer, the thread
+    // wakeup and the ring all cost shows up here. The FFT window adds a further
+    // FFT_SIZE/sampleRate/2 on top, which is analytic.
+    static int frameAgeMs = 0;
+    static int frameAgeMax = 0;
 }
