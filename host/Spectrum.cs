@@ -73,7 +73,7 @@ static class Program
     // noise, leaving the low half of the display empty. Widening the bands
     // (raising MIN_BINS) cannot fix that -- a band made wider still only
     // holds the same 1-2 bins' worth of energy. The fix is averaging over
-    // time, which is what AVG_LOW does below. Resolution is bought with a few
+    // time, which is what the inline average in EmitFrame does below. Resolution is bought with a few
     // frames of history instead of a longer window, because frames of history
     // cost latency only in proportion and can be made band-dependent.
     const int FFT_SIZE = 2048;
@@ -85,10 +85,10 @@ static class Program
     // ramp constant is needed: the criterion is bins-per-band, not frequency.
 
     // Release smoothing on the mapped 0..1 bar value. This is what the eye
-    // reads as "the bars lag the music", so it is kept short. 0.66/0.45 is a
-    // one-frame time constant; the visual smoothing lives in the renderer,
-    // which has the real frame delta and can be tuned per display rate.
-    const double SMOOTH_UP = 0.66;
+    // reads as "the bars lag the music", so it is kept short. 0.85/0.45 is a
+    // sub-frame time constant on the attack; the visual smoothing lives in the
+    // renderer, which has the real frame delta and can be tuned per display rate.
+    const double SMOOTH_UP = 0.85;
     const double SMOOTH_DOWN = 0.45;
     const int MAX_MSG = 60 * 1024;
     const int FRAME_MS = 8;
@@ -227,6 +227,14 @@ static class Program
     static Dictionary<string, long> blocked = new Dictionary<string, long>();
     const long BLOCK_MS = 30000;
 
+    // Harness mode (--default): capture ONLY the default render endpoint.
+    // The loudest-tap picker is right for the app, which must follow
+    // per-app routing, but a latency probe that plays its click into the
+    // default device cannot tolerate the winner flip-flopping between
+    // endpoints mid-measurement -- the click then lands in a ring buffer
+    // nobody is draining and the whole measurement silently turns to music.
+    static bool DefaultOnly = false;
+
     static List<MMDevice> RenderEndpoints()
     {
         var all = new List<MMDevice>();
@@ -239,6 +247,7 @@ static class Program
                 all.Add(def);
             }
             catch { }
+            if (DefaultOnly) return all;
             foreach (var d in en.EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active))
             {
                 bool dup = false;
@@ -373,8 +382,9 @@ static class Program
     // flat line no matter how loud the music is.
     static int sampleRate = 0;
 
-    static void Main()
+    static void Main(string[] args)
     {
+        foreach (string a in args) if (a == "--default") DefaultOnly = true;
         timeBeginPeriod(1);
         Send("{\"type\":\"hello\",\"host\":\"spectrum-sink\"}");
         Note("boot", "spectrum sink start");
@@ -587,21 +597,30 @@ static class Program
                 }
 
                 // Time-average, but ONLY the bands that are actually thin. At 2048/48 kHz
-    // one bin is 23.4 Hz, and the narrowest bands at the bottom of the log
-    // scale span 2-4 bins -- those jump around frame to frame and read as
-    // noise. Everything above 4 bins is already stable, and averaging it too
-    // would just stack another low-pass on the whole display for nothing.
-    // Priming is outright on the first frame so a song change does not fade
-    // in from stale history.
-    for (int b = 0; b < BANDS; b++)
-    {
-        int bins = edges[b + 1] - edges[b];
-        double a = bins < 4 ? 0.30 : 1.0;
-        if (a >= 1.0 || !bandAvgPrimed) bandAvg[b] = bandDb[b];
-        else bandAvg[b] += (bandDb[b] - bandAvg[b]) * a;
-        bandDb[b] = bandAvg[b];
-    }
-    bandAvgPrimed = true;
+                // one bin is 23.4 Hz, and the narrowest bands at the bottom of the log
+                // scale span 2-4 bins -- those jump around frame to frame and read as
+                // noise. Everything above 4 bins is already stable, and averaging it too
+                // would just stack another low-pass on the whole display for nothing.
+                // Priming is outright on the first frame so a song change does not fade
+                // in from stale history.
+                //
+                // Asymmetric on purpose: an onset snaps up at 0.70 so a drum hit is
+                // never slow-filtered, while the way down keeps the 0.30 average that
+                // kills the jitter. The up side is where perceived latency hides --
+                // a kick band used to crawl through 0.30 both ways for ~57ms before
+                // the renderer even saw it.
+                for (int b = 0; b < BANDS; b++)
+                {
+                    int bins = edges[b + 1] - edges[b];
+                    if (bins >= 4 || !bandAvgPrimed) bandAvg[b] = bandDb[b];
+                    else
+                    {
+                        double av = bandDb[b] > bandAvg[b] ? 0.70 : 0.30;
+                        bandAvg[b] += (bandDb[b] - bandAvg[b]) * av;
+                    }
+                    bandDb[b] = bandAvg[b];
+                }
+                bandAvgPrimed = true;
             }
             else
             {

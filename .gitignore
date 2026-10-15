@@ -1,1 +1,4 @@
-*.bakhost/measure.exe
+*.bak
+host/measure.exe
+host/clickplay.exe
+host/spectrum-sink.exe

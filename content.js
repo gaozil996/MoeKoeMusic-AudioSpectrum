@@ -25,7 +25,7 @@
     opacity: 0.72,
     color: '#ff4d8d',
     glow: 0.55,
-    smoothing: 1.0,     // 0.3..2，面板上的「柔和度」，越大越黏（见 animate 里的 tau）
+    smoothing: 1.0,     // 0.3..2，面板上的「柔和度」，越大下行越黏（上行恒快）
     peakHold: 520,      // ms，峰值保持
     peakFade: 780       // ms，峰值淡出
   };
@@ -99,7 +99,14 @@
       // 30% -> 8ms（几乎不平滑），100% -> 28ms（默认），200% -> 56ms（很黏）。
       var tau = (0.028 - 0.016 * f) * Math.max(0.3, k);
       // 指数逼近；dt 参与计算，所以 30fps 和 144fps 下的观感一致。
-      var a = 1 - Math.exp(-dt / tau);
+      //
+      // 上行另用一条 tau/4：鼓点要一两帧内跳到位。感知延迟里「柱子爬到顶」
+      // 那 50~90ms 就是这层攒出来的 —— 三层上升平滑（宿主 bandAvg、宿主
+      // SMOOTH_UP、这里）串成一条长指数链，全走 63% 就要 60ms 起。柔和度
+      // 只管下行：肉眼判定「柔和」看的是回落拖尾，不是起跳速度，两头都慢
+      // 只是白付延迟。
+      var rising = t > level[i];
+      var a = 1 - Math.exp(-dt / (rising ? tau * 0.25 : tau));
       var prev = level[i];
       level[i] += (t - level[i]) * a;
 
