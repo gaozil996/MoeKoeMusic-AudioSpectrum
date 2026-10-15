@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using NAudio.CoreAudioApi;
@@ -41,6 +42,15 @@ using NAudio.Wave;
 
 static class Program
 {
+    // Thread.Sleep rounds up to the system timer tick, which is ~15.6 ms
+    // unless somebody asks for finer. timeBeginPeriod(1) makes the tick 1 ms
+    // process-wide while we run, so FRAME_MS=8 really sleeps ~8 ms instead of
+    // 15.6. Without this the frame loop can never beat the tick no matter
+    // what number we put in Sleep, and the frame interval is a visible third
+    // of the lag budget. Browsers and media players do exactly this.
+    [DllImport("winmm.dll")]
+    static extern uint timeBeginPeriod(uint uPeriod);
+
     // Latency budget, biggest term first, after measuring rather than guessing.
     //
     // The `age=` field in the frame log is the measured age of the newest
@@ -70,28 +80,18 @@ static class Program
     const int BANDS = 64;
     const int MIN_BINS = 2;       // every band must span at least this many bins
 
-    // Temporal smoothing per band, applied to the raw dB before anything else.
-    // Only the first handful of bands are thin enough to need it; the ramp is
-    // therefore steep (pow 0.35), so the low end gets stability and the rest
-    // of the display is left as responsive as it was before.
-    const double AVG_HIGH = 0.60; // strongest band: barely averaged
-    const double AVG_LOW = 0.28;  // weakest band: tau ~ 2.6 frames
+    // Temporal averaging now lives inline in EmitFrame, gated per band by how
+    // many bins it actually spans (see the "thin band" note there). No global
+    // ramp constant is needed: the criterion is bins-per-band, not frequency.
 
     // Release smoothing on the mapped 0..1 bar value. This is what the eye
-    // reads as "the bars lag the music", so it is kept short. 0.55/0.45 is a
+    // reads as "the bars lag the music", so it is kept short. 0.66/0.45 is a
     // one-frame time constant; the visual smoothing lives in the renderer,
     // which has the real frame delta and can be tuned per display rate.
     const double SMOOTH_UP = 0.66;
     const double SMOOTH_DOWN = 0.45;
     const int MAX_MSG = 60 * 1024;
-    const int FRAME_MS = 10;          // Windows rounds Thread.Sleep up to the
-                                      // scheduler tick (~15.6 ms), so this
-                                      // really runs at ~15.6 ms and cannot be
-                                      // asked for less without spinning. Left
-                                      // alone deliberately: burning a core to
-                                      // recover 5 ms is a bad trade. 16 was the
-                                      // trap -- it rounds to two ticks and
-                                      // gives 33 fps.
+    const int FRAME_MS = 8;
     const double DB_RANGE = 40.0;     // visible dynamic range, in dB
     const double DB_HEADROOM = 8.0;   // keep the loudest band off the ceiling
     const double AGC_ATTACK = 1.0;    // track a rise instantly
@@ -375,6 +375,7 @@ static class Program
 
     static void Main()
     {
+        timeBeginPeriod(1);
         Send("{\"type\":\"hello\",\"host\":\"spectrum-sink\"}");
         Note("boot", "spectrum sink start");
 
@@ -585,17 +586,22 @@ static class Program
                     if (db > frameMaxDb) frameMaxDb = db;
                 }
 
-                // Time-average, strongest response on the bands that span most
-                // bins. First frame primes the average outright so a song
-                // change does not fade in from a stale history.
-                for (int b = 0; b < BANDS; b++)
-                {
-                    double a = AVG_LOW + (AVG_HIGH - AVG_LOW) * Math.Pow(b / (double)(BANDS - 1), 0.35);
-                    if (!bandAvgPrimed) bandAvg[b] = bandDb[b];
-                    else bandAvg[b] += (bandDb[b] - bandAvg[b]) * a;
-                    bandDb[b] = bandAvg[b];
-                }
-                bandAvgPrimed = true;
+                // Time-average, but ONLY the bands that are actually thin. At 2048/48 kHz
+    // one bin is 23.4 Hz, and the narrowest bands at the bottom of the log
+    // scale span 2-4 bins -- those jump around frame to frame and read as
+    // noise. Everything above 4 bins is already stable, and averaging it too
+    // would just stack another low-pass on the whole display for nothing.
+    // Priming is outright on the first frame so a song change does not fade
+    // in from stale history.
+    for (int b = 0; b < BANDS; b++)
+    {
+        int bins = edges[b + 1] - edges[b];
+        double a = bins < 4 ? 0.30 : 1.0;
+        if (a >= 1.0 || !bandAvgPrimed) bandAvg[b] = bandDb[b];
+        else bandAvg[b] += (bandDb[b] - bandAvg[b]) * a;
+        bandDb[b] = bandAvg[b];
+    }
+    bandAvgPrimed = true;
             }
             else
             {
