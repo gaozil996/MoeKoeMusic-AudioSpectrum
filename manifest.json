@@ -2,8 +2,8 @@
   "manifest_version": 3,
   "name": "音乐频谱",
   "plugin_id": "audio-viz",
-  "version": "1.4.0",
-  "description": "全屏歌词页的真实音频频谱。数据来自 Windows WASAPI 环回捕获（系统级，不碰播放链路），逐帧 FFT 后 64 个对数频段，带峰值保持与下落。",
+  "version": "1.4.1",
+  "description": "全屏歌词页的真实音频频谱。WASAPI 环回逐声道分析、相位安全合并 64 个对数频段；补齐低分辨率空频段，歌词设置面板支持屏幕内滚动。",
   "moekoe": true,
   "minversion": "1.7.0",
   "author": {

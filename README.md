@@ -1,8 +1,8 @@
 # MoeKoe Music 音乐频谱插件
 
-全屏歌词页的音乐频谱，八种样式
+全屏歌词页的音乐频谱，八种样式。
 
-Windows WASAPI 环回抓真实音频，8192 点 FFT，同时监听所有输出设备
+Windows WASAPI 环回捕获真实音频，2048 点 FFT，同时监听所有输出设备。1.4.1 起逐声道分析并合并能量，避免左右声道反相时相互抵消；频段按 FFT bin 的实际对数位置映射，并对无独立 bin 的显示频段插值补齐。歌词设置面板内容可在屏幕内滚动。
 
 ## 安装
 
@@ -20,6 +20,5 @@ Windows WASAPI 环回抓真实音频，8192 点 FFT，同时监听所有输出�
 
 ## 更多信息
 
-- [`COMPATIBILITY.md`](COMPATIBILITY.md) —— 依赖应用的哪些类名、设置键和原生接口，
-  以及每一条变了会怎样。应用升级后先照着它查一遍，能分清是「插件坏了」还是「应用变了」。
-- [`README-dev.md`](README-dev.md) 是给改代码的人看的，记着踩过的坑。
+- [`COMPATIBILITY.md`](COMPATIBILITY.md) —— 依赖应用的哪些类名、设置键和原生接口。
+- [`README-dev.md`](README-dev.md) —— 架构和开发注意事项。

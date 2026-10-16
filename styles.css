@@ -43,3 +43,28 @@
   width: 100%;
   height: 100%;
 }
+
+/* The built-in settings drawer can exceed the viewport when multiple plugin
+   sections are expanded. Keep its existing slide-in/centering behavior and
+   scroll the contents inside the visible card instead of clipping top/bottom. */
+.fullscreen-lyrics-settings {
+  max-height: min(80vh, 760px);
+}
+
+.fullscreen-lyrics-settings .settings-panel {
+  box-sizing: border-box;
+  max-height: min(80vh, 760px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: #ffffff55 transparent;
+}
+
+.fullscreen-lyrics-settings .settings-panel::-webkit-scrollbar {
+  width: 6px;
+}
+
+.fullscreen-lyrics-settings .settings-panel::-webkit-scrollbar-thumb {
+  border-radius: 6px;
+  background: #ffffff55;
+}

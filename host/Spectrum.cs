@@ -84,15 +84,21 @@ static class Program
     // many bins it actually spans (see the "thin band" note there). No global
     // ramp constant is needed: the criterion is bins-per-band, not frequency.
 
-    // Release smoothing on the mapped 0..1 bar value. This is what the eye
-    // reads as "the bars lag the music", so it is kept short. 0.85/0.45 is a
-    // sub-frame time constant on the attack; the visual smoothing lives in the
-    // renderer, which has the real frame delta and can be tuned per display rate.
+    // Smoothing on the mapped 0..1 bar value, split by direction. The attack is
+    // a sub-frame time constant, because that is the only side the eye reads as
+    // "lagging the music". The release is the opposite: it is what the 柔和度
+    // slider is supposed to govern, and a fast stage here caps it no matter what
+    // the renderer asks for. 0.45 at FRAME_MS was a ~15 ms fall, i.e. the bar hit
+    // the floor in one or two frames -- the slider could only add a few ms on top
+    // of that. 0.10 puts this stage at ~70 ms, so the renderer's 26..170 ms is
+    // what actually sets the tail.
     const double SMOOTH_UP = 0.85;
-    const double SMOOTH_DOWN = 0.45;
+    const double SMOOTH_DOWN = 0.10;
     const int MAX_MSG = 60 * 1024;
     const int FRAME_MS = 8;
-    const double DB_RANGE = 40.0;     // visible dynamic range, in dB
+    const double DB_RANGE = 46.0;     // visible dynamic range, in dB
+    const double GATE_DB = 24.0;      // how far below the loudest band content may sit
+    const double GATE_SLOPE = 3.0;    // dB of attenuation per dB past the gate
     const double DB_HEADROOM = 8.0;   // keep the loudest band off the ceiling
     const double AGC_ATTACK = 1.0;    // track a rise instantly
     const double AGC_RELEASE = 0.020; // fall back slowly, so it never pumps
@@ -200,7 +206,7 @@ static class Program
         public string Name;
         public WasapiLoopbackCapture Cap;
 
-        public readonly float[] Ring = new float[FFT_SIZE];
+        public float[][] Rings;
         public int RingPos;
         public int RingLen;
 
@@ -278,6 +284,8 @@ static class Program
         var fmt = cap.WaveFormat;
         t.SampleRate = fmt.SampleRate;
         t.Ch = Math.Max(1, fmt.Channels);
+        t.Rings = new float[t.Ch][];
+        for (int c = 0; c < t.Ch; c++) t.Rings[c] = new float[FFT_SIZE];
         t.Bps = Math.Max(1, fmt.BitsPerSample / 8);
         t.Bpf = Math.Max(1, t.Ch * t.Bps);
         t.IsFloat = fmt.Encoding == WaveFormatEncoding.IeeeFloat;
@@ -363,8 +371,11 @@ static class Program
     // ------------------------------------------------------------------
     // Streaming loop
     // ------------------------------------------------------------------
-    static int[] edges = new int[BANDS + 1];
     static Cpx[] buf = new Cpx[FFT_SIZE];
+    static int[] binBand0 = new int[FFT_SIZE / 2 + 1];
+    static int[] binBand1 = new int[FFT_SIZE / 2 + 1];
+    static double[] binMix1 = new double[FFT_SIZE / 2 + 1];
+    static double[] bandCoverage = new double[BANDS];
     static float[] smooth = new float[BANDS];
     static float[] peak = new float[BANDS];
     static double[] bandDb = new double[BANDS];
@@ -487,16 +498,13 @@ static class Program
             for (int f = 0; f < frames; f++)
             {
                 int baseIdx = f * t.Bpf;
-                float sum = 0f;
                 for (int c = 0; c < t.Ch; c++)
                 {
-                    sum += DecodeSample(raw, baseIdx + c * t.Bps, t.Bps, t.IsFloat);
+                    float sample = DecodeSample(raw, baseIdx + c * t.Bps, t.Bps, t.IsFloat);
+                    t.Rings[c][t.RingPos] = sample;
+                    double a = sample < 0 ? -sample : sample;
+                    if (a > peak) peak = a;
                 }
-                float m = sum / t.Ch;
-                double a = m < 0 ? -m : m;
-                if (a > peak) peak = a;
-
-                t.Ring[t.RingPos] = m;
                 t.RingPos = (t.RingPos + 1) & (FFT_SIZE - 1);
                 if (t.RingLen < FFT_SIZE) t.RingLen++;
             }
@@ -508,7 +516,11 @@ static class Program
     static float DecodeSample(byte[] raw, int off, int bps, bool isFloat)
     {
         if (off + bps > raw.Length) return 0f;
-        if (isFloat && bps == 4) return BitConverter.ToSingle(raw, off);
+        if (isFloat && bps == 4)
+        {
+            float f = BitConverter.ToSingle(raw, off);
+            return float.IsNaN(f) || float.IsInfinity(f) ? 0f : f;
+        }
         if (bps == 2) return BitConverter.ToInt16(raw, off) / 32768f;
         if (bps == 1) return (sbyte)raw[off] / 128f;
         if (bps == 4) return BitConverter.ToInt32(raw, off) / 2147483648f;
@@ -529,25 +541,27 @@ static class Program
         try
         {
             int n = 0;
-            float[] src = null;
+            float[][] src = null;
+            int channels = 0;
             int pos = 0;
             lock (TapLock)
             {
                 if (t != null && !t.Broken && t.RingLen >= FFT_SIZE)
                 {
-                    src = t.Ring; pos = t.RingPos; n = FFT_SIZE;
-                    if (t.SampleRate != sampleRate) { sampleRate = t.SampleRate; BuildEdges(sampleRate); }
+                    src = t.Rings; channels = t.Ch; pos = t.RingPos; n = FFT_SIZE;
+                    if (t.SampleRate != sampleRate) { sampleRate = t.SampleRate; BuildBandMap(sampleRate); }
                 }
             }
 
             double energy = 0;
             if (n == FFT_SIZE)
-                for (int i = 0; i < FFT_SIZE; i++)
-                {
-                    double v = src[(pos + i) & (FFT_SIZE - 1)];
-                    energy += v * v;
-                }
-            frameRms = n == FFT_SIZE ? Math.Sqrt(energy / FFT_SIZE) : 0;
+                for (int c = 0; c < channels; c++)
+                    for (int i = 0; i < FFT_SIZE; i++)
+                    {
+                        double v = src[c][(pos + i) & (FFT_SIZE - 1)];
+                        energy += v * v;
+                    }
+            frameRms = n == FFT_SIZE && channels > 0 ? Math.Sqrt(energy / (FFT_SIZE * channels)) : 0;
             frame++;
 
             if (t != null && t.LastByteAt > 0)
@@ -563,34 +577,57 @@ static class Program
             double frameMaxDb = -200.0;
             if (n == FFT_SIZE)
             {
-                // Oldest sample first. RingPos points at the next slot to
-                // write, so the oldest sample is the one it points at.
-                for (int i = 0; i < FFT_SIZE; i++)
+                Array.Clear(bandPower, 0, BANDS);
+                for (int c = 0; c < channels; c++)
                 {
-                    float s = src[(pos + i) & (FFT_SIZE - 1)];
-                    buf[i].X = s * window[i];
-                    buf[i].Y = 0;
+                    // Oldest sample first. RingPos points at the next slot to write.
+                    for (int i = 0; i < FFT_SIZE; i++)
+                    {
+                        float s = src[c][(pos + i) & (FFT_SIZE - 1)];
+                        buf[i].X = s * window[i];
+                        buf[i].Y = 0;
+                    }
+                    Fft(buf, FFT_SIZE);
+
+                    // Add each channel's power independently. Averaging signed
+                    // samples before FFT loses anti-phase stereo content.
+                    for (int i = 1; i < FFT_SIZE / 2; i++)
+                    {
+                        int b0 = binBand0[i];
+                        if (b0 < 0) continue;
+                        double re = buf[i].X, im = buf[i].Y;
+                        double power = re * re + im * im;
+                        double w1 = binMix1[i];
+                        bandPower[b0] += power * (1.0 - w1);
+                        int b1 = binBand1[i];
+                        if (b1 != b0) bandPower[b1] += power * w1;
+                    }
                 }
-                Fft(buf, FFT_SIZE);
+
+                // Short FFT windows cannot provide a unique bin for every
+                // display band, especially at 48 kHz. Interpolate empty bands
+                // from their neighbours rather than outputting false silence.
+                for (int b = 0; b < BANDS; b++)
+                {
+                    if (bandCoverage[b] > 0) continue;
+                    int left = b - 1, right = b + 1;
+                    while (left >= 0 && bandCoverage[left] <= 0) left--;
+                    while (right < BANDS && bandCoverage[right] <= 0) right++;
+                    if (left < 0 && right >= BANDS) continue;
+                    if (left < 0) bandPower[b] = bandPower[right];
+                    else if (right >= BANDS) bandPower[b] = bandPower[left];
+                    else
+                    {
+                        double f = (double)(b - left) / (right - left);
+                        bandPower[b] = bandPower[left] + (bandPower[right] - bandPower[left]) * f;
+                    }
+                }
 
                 for (int b = 0; b < BANDS; b++)
                 {
-                    int s0 = edges[b], e0 = Math.Min(edges[b + 1], FFT_SIZE / 2);
-
-                    // Sum ENERGY across the band, not the mean magnitude.
-                    // Averaging over bins makes a wide high-frequency band
-                    // read quieter than a narrow low-frequency one carrying
-                    // the same energy -- which is why the old code needed a
-                    // fake tilt.
-                    double power = 0;
-                    for (int i = s0; i < e0; i++)
-                    {
-                        double re = buf[i].X, im = buf[i].Y;
-                        power += re * re + im * im;
-                    }
-
-                    // FFT_SIZE/4 is the amplitude one bin shows for a unit sine.
-                    double amp = Math.Sqrt(power) / (FFT_SIZE * 0.25);
+                    // Average power across channels so normal stereo stays at
+                    // the same level while phase-opposed channels no longer cancel.
+                    double amp = Math.Sqrt(bandPower[b] / Math.Max(1, channels)) / (FFT_SIZE * 0.25);
                     double db = 20.0 * Math.Log10(amp + 1e-9);
                     bandDb[b] = db;
                     if (db > frameMaxDb) frameMaxDb = db;
@@ -611,8 +648,7 @@ static class Program
                 // the renderer even saw it.
                 for (int b = 0; b < BANDS; b++)
                 {
-                    int bins = edges[b + 1] - edges[b];
-                    if (bins >= 4 || !bandAvgPrimed) bandAvg[b] = bandDb[b];
+                    if (bandCoverage[b] >= 4.0 || !bandAvgPrimed) bandAvg[b] = bandDb[b];
                     else
                     {
                         double av = bandDb[b] > bandAvg[b] ? 0.70 : 0.30;
@@ -631,8 +667,34 @@ static class Program
             // A single whistle or a cymbal crash sets the absolute maximum far
             // above where the rest of the music sits, so anchoring to it pins
             // every ordinary band to the floor and the display looks dead.
-            // The 92nd percentile tracks the body of the music.
+            // 96th of 64 bands is two or three bands below the loudest: sharp
+            // enough that the floor sits near the bottom of the scale, loose
+            // enough that one hot band does not darken the whole display.
             double refDb = Percentile();
+
+            // Spectral gate, relative to the loudest band of this frame.
+            //
+            // Without it the display has almost no contrast. Measured with a
+            // synthetic comb (8 tones, known amplitudes) and single sines:
+            // a lone 60 Hz tone lit the top of the scale at 147/255 -- 78% of
+            // the level of the band actually carrying the tone -- because a
+            // Hann window's first sidelobe sits only -31 dB down, the AGC
+            // anchors on the 92nd percentile (i.e. on that sidelobe floor),
+            // and the gamma curve then lifts it further. Eight tones came out
+            // at 1.2-1.8x peak-to-valley, and the bar-height order did not
+            // match the amplitude order at all.
+            //
+            // So: anything more than GATE_DB below the loudest band is pushed
+            // down at GATE_SLOPE instead of being shown. A slope rather than a
+            // cliff, because a hard cut makes bands flicker on and off as they
+            // cross the threshold. Real music spans 25-40 dB between bands, so
+            // this only touches the noise floor and whatever the window leaks.
+            //
+            // Runs after Percentile() on purpose: the AGC must keep tracking
+            // the body of the music, not the gated result.
+            double gate = frameMaxDb - GATE_DB;
+            for (int b = 0; b < BANDS; b++)
+                if (bandDb[b] < gate) bandDb[b] = gate - (gate - bandDb[b]) * GATE_SLOPE;
 
             // ---- Pass 2: automatic gain -------------------------------
             // A fixed dB window cannot serve every track: a quiet acoustic
@@ -663,11 +725,11 @@ static class Program
                 if (v < 0) v = 0;
                 if (v > 1) v = 1;
 
-                // A little gamma below 1 lifts the middle of the range. Safe to
-                // do now that the gain control already pins the loudest band,
-                // which is what used to drive every band to 255 and turn the
-                // whole display into a solid wall.
-                v = Math.Pow(v, 0.68);
+                // Gamma below 1 lifts the middle of the range. 0.68 used to be
+                // safe because the AGC pinned the loudest band; it also squashed
+                // whatever contrast there was, which is what the gate above is
+                // now fighting for. 0.80 keeps the lift without flattening it.
+                v = Math.Pow(v, 0.80);
 
                 // Attack fast, release fast. This filter used to be 0.22/0.78 on the way
                 // down, a 3.5-frame tail that showed up as the bar visibly
@@ -702,48 +764,37 @@ static class Program
         catch { }
     }
 
-    static void BuildEdges(int sr)
+    static void BuildBandMap(int sr)
     {
-        // 35 Hz - 16 kHz on a log scale.
-        //
-        // The band count is fixed at 64, so a too-short FFT leaves the
-        // narrowest bands spanning a single bin (at 48 kHz / 2048 points one
-        // bin is 23.4 Hz, so most bands held only 1-2 bins). A band that
-        // thin carries almost no energy, which is why the left half of the
-        // display stayed empty no matter how the gain was set.
-        //
-        // 4096 points at 48 kHz gives 11.7 Hz per bin, and MIN_BINS guarantees
-        // no band is ever thinner than 3 bins -- 35 Hz across the narrow end,
-        // which is wide enough to carry a stable magnitude. Going finer than
-        // this only buys resolution the display does not use, at 85 ms of lag
-        // per doubling.
+        // Map each real FFT bin to its exact logarithmic position instead of
+        // forcing every display band to own two bins. The old forward-widening
+        // pushed low-frequency edges rightward until 1 kHz landed ~14 bars too
+        // far left. Adjacent interpolation preserves every bin without holes.
         double lo = Math.Log10(35.0), hi = Math.Log10(16000.0);
         double binHz = (double)sr / FFT_SIZE;
-
-        for (int i = 0; i <= BANDS; i++)
+        Array.Clear(bandCoverage, 0, BANDS);
+        for (int i = 0; i < binBand0.Length; i++)
         {
-            double hz = Math.Pow(10.0, lo + (hi - lo) * i / BANDS);
-            int bin = (int)Math.Round(hz / binHz);
-            edges[i] = Math.Max(1, Math.Min(FFT_SIZE / 2, bin));
+            binBand0[i] = -1;
+            binBand1[i] = -1;
+            binMix1[i] = 0;
         }
-
-        // Widen any band that came out too thin, keeping them ordered and
-        // non-overlapping. Bands can drift upward past the intended top, but
-        // that only costs a little high-end resolution, which is better than
-        // half the display reading zero.
-        for (int i = 1; i <= BANDS; i++)
+        for (int i = 1; i < FFT_SIZE / 2; i++)
         {
-            int want = edges[i - 1] + MIN_BINS;
-            if (edges[i] < want) edges[i] = want;
+            double hz = i * binHz;
+            if (hz > 16000.0) continue;
+            double p = (Math.Log10(hz) - lo) / (hi - lo) * (BANDS - 1);
+            if (p < 0) p = 0;
+            if (p > BANDS - 1) p = BANDS - 1;
+            int b0 = (int)Math.Floor(p);
+            int b1 = Math.Min(BANDS - 1, b0 + 1);
+            double mix = b1 == b0 ? 0.0 : p - b0;
+            binBand0[i] = b0;
+            binBand1[i] = b1;
+            binMix1[i] = mix;
+            bandCoverage[b0] += 1.0 - mix;
+            if (b1 != b0) bandCoverage[b1] += mix;
         }
-        // Clamp the top so the widening cannot run past Nyquist.
-        for (int i = BANDS; i >= 1; i--)
-        {
-            int limit = i == BANDS ? FFT_SIZE / 2 : edges[i + 1];
-            if (edges[i] > limit) edges[i] = limit;
-        }
-        for (int i = 1; i <= BANDS; i++)
-            if (edges[i] <= edges[i - 1]) edges[i] = edges[i - 1] + 1;
     }
 
     // Hann window: without it spectral leakage smears every band and the
@@ -758,6 +809,7 @@ static class Program
     }
 
     static double[] dbScratch = new double[BANDS];
+    static double[] bandPower = new double[BANDS];
 
     static double Percentile()
     {
@@ -766,7 +818,7 @@ static class Program
         // spectrum into a meaningless jumble.
         Array.Copy(bandDb, dbScratch, BANDS);
         Array.Sort(dbScratch);
-        int idx = (int)(BANDS * 0.92);
+        int idx = (int)(BANDS * 0.96);
         if (idx >= BANDS) idx = BANDS - 1;
         return dbScratch[idx];
     }
